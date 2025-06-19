@@ -1,0 +1,81 @@
+=== VIDEO DATASET ANALYSIS ===
+
+Analyzing JSON file: /home/csgrad/susimmuk/acmdeepfake/data/extracted_frames/train_metadata_with_audio.json
+
+JSON Analysis Results:
+  Total entries: 20189
+  Real videos: 8880
+  Fake videos: 11309
+Scanning lrs3 directory: /home/csgrad/susimmuk/acmdeepfake/data/extracted_frames/lrs3
+Scanning vox_celeb_2 directory: /home/csgrad/susimmuk/acmdeepfake/data/extracted_frames/vox_celeb_2
+Scanning silent_videos directory: /home/csgrad/susimmuk/acmdeepfake/data/extracted_frames/silent_videos
+
+Folder Structure Analysis:
+
+  lrs3:
+    Identities: 888
+    Real folders: 1465
+      - With JSON: 1465 (100.0% if real_folders > 0)
+      - Without JSON: 0
+    Fake folders: 649
+      - With JSON: 649 (100.0% if fake_folders > 0)
+      - Without JSON: 0
+    Total folders: 2114
+      - With JSON: 2114 (100.0% if total_folders > 0)
+      - Without JSON: 0
+
+  vox_celeb_2:
+    Identities: 1657
+    Real folders: 7300
+      - With JSON: 7211 (98.8% if real_folders > 0)
+      - Without JSON: 89
+    Fake folders: 10482
+      - With JSON: 10458 (99.8% if fake_folders > 0)
+      - Without JSON: 24
+    Total folders: 17782
+      - With JSON: 17669 (99.4% if total_folders > 0)
+      - Without JSON: 113
+
+    Sample real folders without JSON (showing up to 3):
+      - vox_celeb_2/id00064/real/4DIJmbydVEA_00019
+      - vox_celeb_2/id00578/real/E-0k3-mQ9cE_00031
+      - vox_celeb_2/id00475/real/sDQ6akGQWK0_00094
+      - ... and 86 more
+
+    Sample fake folders without JSON (showing up to 3):
+      - vox_celeb_2/id00591/fake/dA4a1RGGWNA_00048
+      - vox_celeb_2/id00502/fake/LCIl_qW5lkY_00066
+      - vox_celeb_2/id00496/fake/SImaDcXQnh8_00014
+      - ... and 21 more
+
+  silent_videos:
+    Identities: 44
+    Real folders: 203
+      - With JSON: 203 (100.0% if real_folders > 0)
+      - Without JSON: 0
+    Fake folders: 203
+      - With JSON: 203 (100.0% if fake_folders > 0)
+      - Without JSON: 0
+    Total folders: 406
+      - With JSON: 406 (100.0% if total_folders > 0)
+      - Without JSON: 0
+
+Overall Folder Statistics:
+  Total identities: 2589
+  Total real folders: 8968
+    - With JSON: 8879 (99.0% if real_folders > 0)
+    - Without JSON: 89
+  Total fake folders: 11334
+    - With JSON: 11310 (99.8% if fake_folders > 0)
+    - Without JSON: 24
+  Total folders: 20302
+    - With JSON: 20189 (99.4%)
+    - Without JSON: 113
+
+=== COMPARISON ===
+JSON file entries: 20189
+  - Real: 8880
+  - Fake: 11309
+Physical folders: 20302
+  - Real: 8968
+  - Fake: 11334
