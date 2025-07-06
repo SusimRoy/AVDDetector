@@ -1,6 +1,4 @@
-import timm
 from lightning.pytorch import LightningModule
-from torch.nn import CrossEntropyLoss, L1Loss
 from torch.optim import Adam
 from transformers import VideoMAEImageProcessor, AutoModel, AutoConfig
 import numpy as np
@@ -9,8 +7,8 @@ from audiossl.methods.atstframe.embedding import load_model,get_scene_embedding,
 import audiossl.methods.atstframe.embedding as embedding
 import torch.nn as nn
 from torchmetrics.classification import AUROC
-from models.c3d import C3DVideoEncoder
-
+from models.mvit import MvitVideoEncoder
+import torch.nn.functional as F
 
 class FusionModule(nn.Module):
     def __init__(self, dim):
@@ -76,83 +74,54 @@ class CrossAttention(nn.Module):
         return attended
 
 class GatedFusion(nn.Module):
-    def __init__(self, feat_dim):
+    def __init__(self, in_feats, out_feats):
         super().__init__()
-        # Learnable linear layer for gating (can include both features)
-        self.gate_fc = nn.Linear(feat_dim * 2, feat_dim)
+        self.gate_fc = nn.Linear(in_feats, out_feats)
         
     def forward(self, feat1, feat2):
         # feat1, feat2: [B, 256]
-        concat_feats = torch.cat([feat1, feat2], dim=-1)  # [B, 512]
-        gates = torch.sigmoid(self.gate_fc(concat_feats)) # [B, 256], values in [0,1]
-        # Gate feat1, use (1-gate) for feat2 (complementary)
-        fused = gates * feat1 + (1 - gates) * feat2       # [B, 256]
+        concat_feats = torch.cat([feat1, feat2], dim=-1)  
+        gates = torch.sigmoid(self.gate_fc(concat_feats)) 
+        fused = gates * feat1 + (1 - gates) * feat2      
         return fused
 
 class AVClassifier(LightningModule):
-    def __init__(self, lr, n_channels, distributed=False):
+    def __init__(self, lr, distributed=False):
         super(AVClassifier, self).__init__()
         self.lr = lr
-        self.config = AutoConfig.from_pretrained("OpenGVLab/VideoMAEv2-Large", trust_remote_code=True)
-        self.video_processor = VideoMAEImageProcessor.from_pretrained("OpenGVLab/VideoMAEv2-Large")
-        self.videoextractor = AutoModel.from_pretrained('OpenGVLab/VideoMAEv2-Large', config=self.config, trust_remote_code=True).eval().requires_grad_(False)
-        # videoextractor.eval()
-        # for param in videoextrasctor.parameters():
-        #     param.requires_grad = False
-        # self.add_module('videoextractor', videoextractor)
-        self.videofeatures = C3DVideoEncoder(n_features=(64, 96, 128, 128), v_cla_feature_in=256)  # Initialize C3D encoder
-        # self.gated_fusion = GatedFusion(feat_dim=256)  # Initialize gated fusion module
-        # Initialize audio extractor as buffer
+        self.config = AutoConfig.from_pretrained("OpenGVLab/VideoMAEv2-Base", trust_remote_code=True)
+        self.video_processor = VideoMAEImageProcessor.from_pretrained("OpenGVLab/VideoMAEv2-Base")
+        self.videoextractor = AutoModel.from_pretrained('OpenGVLab/VideoMAEv2-Base', config=self.config, trust_remote_code=True).eval().requires_grad_(False)
+        self.videofeatures = MvitVideoEncoder(v_cla_feature_in=256, temporal_size=112, mvit_type="mvit_v2_t")
         self.audioextractor = load_model("/home/csgrad/susimmuk/acmdeepfake/audio-extraction/atstframe_base.ckpt").eval().requires_grad_(False)
-        self.videofeatures = MvitVideoEncoder(v_cla_feature_in=v_cla_feature_in, temporal_size=temporal_size, mvit_type="mvit_v2_s")
-        # audioextractor.eval()
-        # for param in audioextractor.parameters():
-        #     param.requires_grad = False
-        # self.add_module('audioextractor', audioextractor)
         self.cross_attention = CrossAttention(dim_q=256, dim_k=256, dim_out=256)
         self.loss_fn = nn.BCEWithLogitsLoss()
         self.conv1d_reduce = nn.Conv1d(768*embedding.N_BLOCKS, 256, kernel_size=1, bias=False)
         self.fc1 = nn.Linear(256+768, 1, bias=False)
-        # self.conv2 = nn.Conv1d(786, 256, kernel_size=1, bias=False)
-        # self.fc2 = nn.Linear(768, 256, bias=False)
 
         self.distributed = distributed
         self.init_weights()
         self.training_step_outputs = []
         self.validation_step_outputs = []
         self.train_auc = AUROC(task="binary", sync_on_compute=True)
-
+        self.test_probs = []
+ 
     def setup(self, stage: str):
 
         self.videoextractor.to(self.device)
+        self.videofeatures.to(self.device)
         self.audioextractor.to(self.device)
+        self.cross_attention.to(self.device)
 
     def init_weights(self):
         nn.init.kaiming_normal_(self.fc1.weight)
         
-        # Initialize conv1d_reduce layer
         nn.init.kaiming_normal_(self.conv1d_reduce.weight)
-        # nn.init.kaiming_normal_(self.fc2.weight)
-        
-        # Initialize cross attention weights
+    
         nn.init.kaiming_normal_(self.cross_attention.W_q.weight)
         nn.init.kaiming_normal_(self.cross_attention.W_k.weight)
         nn.init.kaiming_normal_(self.cross_attention.W_v.weight)
         
-        # Initialize C3D video encoder weights
-        for module in self.videofeatures.modules():
-            if isinstance(module, nn.Conv3d):
-                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.Linear):
-                nn.init.kaiming_normal_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.BatchNorm3d):
-                nn.init.constant_(module.weight, 1)
-                nn.init.constant_(module.bias, 0)
-
     def process_video_in_chunks(self, video, chunk_size=16):
         num_frames = video.shape[1]
         num_chunks = num_frames // chunk_size
@@ -175,7 +144,7 @@ class AVClassifier(LightningModule):
     def forward(self, vinp, maginp, audioinp):
         # input : vinp: [B, T1, C, H, W], maginp: [B, T1, C, H, W], audioinp: [B, T2, c2]
         diff = maginp - vinp
-        video = torch.cat([vinp, diff], dim=2)
+        video = torch.cat([vinp, diff], dim=2) 
         vinp_resized = torch.nn.functional.interpolate(vinp.view(-1, vinp.shape[-3], vinp.shape[-2], vinp.shape[-1]), size=(224, 224), mode='bilinear', align_corners=False).reshape(vinp.shape[0], vinp.shape[1], vinp.shape[2], 224, 224)
         rgbfeatures = self.process_video_in_chunks(vinp_resized)
         video = video.permute(0, 2, 1, 3, 4) # [B, T1, C, H, W] -> [B, C, T1, H, W]
@@ -184,17 +153,12 @@ class AVClassifier(LightningModule):
             afeats,_ = get_timestamp_embedding(audioinp, self.audioextractor)
         afeats = afeats.transpose(1, 2)  # [B, T2, 768*12] -> [B, 768*12, T2]
         afeats = self.conv1d_reduce(afeats)  # [B, 768*12, T2] -> [B, 256, T2]
-        afeats = afeats.transpose(1, 2)   # [B, 256, T2] -> [B, T2, 256]
-        target_T = magfeatures.shape[2]  # T1 from magfeatures
-        current_T = afeats.shape[1]      # T2 from afeats
-        if current_T < target_T:
-            last_timestep = afeats[:, -1:, :]
-            repeat_count = target_T - current_T
-            repeated_timesteps = last_timestep.repeat(1, repeat_count, 1)
-            afeats = torch.cat([afeats, repeated_timesteps], dim=1)
-        attn_feats = self.cross_attention(afeats, magfeatures.transpose(1,2))  # [B, T, 256] -> [B, T, 256]
-        # rgbfeatures = self.fc2(rgbfeatures)
-        fusionfeats = torch.cat([rgbfeatures, attn_feats.mean(dim=1)], dim=1)
+        afeats = F.interpolate(afeats, size=magfeatures.shape[2], mode="linear", align_corners=False)
+        afeats = afeats.transpose(1, 2) # [B, 256, T2] -> [B, T2, 256]
+        attn_feats = self.cross_attention(afeats, magfeatures.transpose(1,2)) # [B, T, 256] -> [B, T, 256]
+        afeats += attn_feats
+        afeats = afeats.mean(dim=1)
+        fusionfeats = torch.cat([rgbfeatures, afeats], dim=1)
         y_hat = self.fc1(fusionfeats)  
         return y_hat
 
@@ -210,7 +174,6 @@ class AVClassifier(LightningModule):
 
         return loss
 
-
     def on_train_start(self):
         self.train_loss_sum = 0.0
         self.train_loss_count = 0
@@ -225,5 +188,56 @@ class AVClassifier(LightningModule):
         self.train_auc.reset()
 
     def configure_optimizers(self):
-        optimizer = Adam(self.parameters(), lr=self.lr, betas=(0.9, 0.999), weight_decay =  0.0001)
-        return [optimizer]
+        optimizer = Adam(self.parameters(), lr=self.lr, betas=(0.9, 0.999))
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=self.trainer.max_epochs,  # or total steps if you prefer
+            eta_min=1e-7  # final learning rate
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",  # step if you want per-batch
+                "frequency": 1
+            }
+        }
+
+    def on_test_start(self):
+        self.test_probs = []
+
+    def test_step(self, batch, batch_idx):
+        x1, x2, x3, test_file = batch
+        y_hat = self(x1, x2, x3)
+        probs = torch.sigmoid(y_hat).detach().cpu().numpy().flatten()
+        # test_file is usually a list of filenames
+        if isinstance(test_file, str):
+            test_file = [test_file]
+        # results = []
+        for fname, prob in zip(test_file, probs):
+            self.test_probs.append((fname, float(prob)))
+        # return results
+
+    def on_test_epoch_end(self):
+        if torch.distributed.is_initialized():
+            gathered = [None for _ in range(torch.distributed.get_world_size())]
+            torch.distributed.all_gather_object(gathered, self.test_probs)
+            all_results = []
+            for sublist in gathered:
+                all_results.extend(sublist)
+        else:
+            all_results = self.test_probs
+
+        unique_results = {}
+        for fname, prob in all_results:
+            base = fname.split('/')[-1]
+            if not base.endswith('.mp4'):
+                base = f"{base}.mp4"
+            if base not in unique_results:
+                unique_results[base] = prob
+
+        if getattr(self, "trainer", None) is not None and self.trainer.is_global_zero:
+            with open("prediction.txt", "w") as f:
+                for base, prob in unique_results.items():
+                    f.write(f"{base};{prob}\n")

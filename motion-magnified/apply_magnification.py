@@ -1,7 +1,7 @@
-"""
-Apply motion magnification using MagNet model on frames from frameA, frameB, frameC folders.
-The magnified frames will be stored in the same directory as the input frames.
-"""
+# """
+# Apply motion magnification using MagNet model on frames from frameA, frameB, frameC folders.
+# The magnified frames will be stored in the same directory as the input frames.
+# """
 import os
 import sys
 import cv2
@@ -11,6 +11,17 @@ from tqdm import tqdm
 from magnet import MagNet
 from dataloader import get_gen_ABC, unit_postprocessing, numpy2cuda
 import time
+import concurrent
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import torch
+import numpy as np
+from tqdm import tqdm
+from magnet import MagNet
+from dataloader import get_gen_ABC, unit_postprocessing, numpy2cuda
+import time
+import argparse
+
 
 class Config(object):
     def __init__(self):
@@ -46,7 +57,7 @@ class Config(object):
         self.time_st = time.time()
         self.losses = []
 
-def apply_magnification(frame_dir, model, amp_factor=2.5, output_name="magnified_video.mp4", fps=30):
+def apply_magnification(frame_dir, model, amp_factor=2.5, output_name="magnified_video.mp4", fps=25):
     """
     Apply motion magnification to frames using MagNet model
     Args:
@@ -95,8 +106,8 @@ def apply_magnification(frame_dir, model, amp_factor=2.5, output_name="magnified
         
         # Apply model
         with torch.no_grad():
-            # batch_A = torch.nn.functional.interpolate(batch_A, size=(224, 224), mode='bilinear')
-            # batch_B = torch.nn.functional.interpolate(batch_B, size=(224, 224), mode='bilinear')
+            batch_A = torch.nn.functional.interpolate(batch_A, size=(224, 224), mode='bilinear')
+            batch_B = torch.nn.functional.interpolate(batch_B, size=(224, 224), mode='bilinear')
             y_hats = model(batch_A, batch_B, None, None, amp_factor_tensor, mode='evaluate')
         
         # Process output frames
@@ -120,66 +131,59 @@ def apply_magnification(frame_dir, model, amp_factor=2.5, output_name="magnified
     
     # Release video writer
     out.release()
-        # print(f"Video creation completed: {output_path}")
+    # print(f"Video creation completed: {output_path}")
 
-def process_directory(base_dir, model, amp_factor=2.5):
-    """
-    Process all video directories in the base directory
-    Args:
-        base_dir (str): Base directory containing video directories
-        model (MagNet): Loaded MagNet model
-        amp_factor (float): Amplification factor
-    """
-    for identity in tqdm(os.listdir(base_dir)):
-        identity_path = os.path.join(base_dir, identity)
-        if not os.path.isdir(identity_path):
-            continue
-            
-        # print(f"\nProcessing identity: {identity}")
-        
-        # Process real videos
-        # real_path = os.path.join(identity_path, 'real')
-        # if os.path.exists(real_path):
-        #     # print(f"Processing real videos for {identity}")
-        #     for video_dir in os.listdir(real_path):
-        #         video_path = os.path.join(real_path, video_dir)
-        #         if os.path.isdir(video_path) and not os.path.exists(os.path.join(video_path, f"{video_dir}_magnified.mp4")):
-        #             apply_magnification(video_path, model, amp_factor, f"{video_dir}_magnified.mp4")
-        
-        # Process fake videos
-        fake_path = os.path.join(identity_path, 'fake')
-        if os.path.exists(fake_path):
-            # print(f"Processing fake videos for {identity}")
-            for video_dir in os.listdir(fake_path):
-                video_path = os.path.join(fake_path, video_dir)
-                if os.path.isdir(video_path) and not os.path.exists(os.path.join(video_path, f"{video_dir}_magnified.mp4")):
-                    apply_magnification(video_path, model, amp_factor, f"{video_dir}_magnified.mp4")
+def has_magnified_file(folder_path):
+    """Check if folder contains any file with 'magnified' in its name"""
+    try:
+        for file in os.listdir(folder_path):
+            if 'magnified' in file.lower():
+                return True
+        return False
+    except OSError:
+        return False
+
+def is_video_folder(folder_path):
+    return os.path.isdir(folder_path) and os.path.basename(folder_path).isdigit() and os.path.exists(os.path.join(folder_path, 'frameA')) and os.path.exists(os.path.join(folder_path, 'frameB')) and os.path.exists(os.path.join(folder_path, 'frameC'))
+
+def process_dir(args):
+    frame_dir, model_weights_path, gpu_id = args
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    import torch
+    model = MagNet().cuda()
+    model.load_state_dict(torch.load(model_weights_path))
+    model.eval()
+    apply_magnification(frame_dir, model)
 
 def main():
-    # if len(sys.argv) != 2:
-    #     print("Usage: python apply_magnification.py <extracted_frames_directory>")
-    #     sys.exit(1)
-    
-    # base_dir = sys.argv[1]
-    # if not os.path.exists(base_dir):
-    #     print(f"Error: Directory {base_dir} does not exist")
-    #     sys.exit(1)
-    
-    # # Initialize and load model
-    weights_path = '/home/csgrad/susimmuk/acmdeepfake/motion-magnified/magnet_epoch12_loss7.28e-02.pth'
-    model = MagNet().cuda()
-    model.load_state_dict(torch.load(weights_path))
-    model.eval()
-    
-    # # Process the directory
-    # process_directory(base_dir, model)
-    apply_magnification(
-        frame_dir='/home/csgrad/susimmuk/acmdeepfake/data/extracted_frames/vox_celeb_2/id00561/fake/8snVgZMIzRY_00032',
-        model=model,
-        amp_factor=2.5,
-        output_name="8snVgZMIzRY_00032_magnified.mp4",
-        fps=30
-    )
+    parser = argparse.ArgumentParser(description="Process video frame folders to create frameA, frameB, frameC.")
+    parser.add_argument('--base_dir', type=str, required=True, help='Base directory containing video folders')
+    parser.add_argument('--mag_weight_path', type=str, required=True)
+    args = parser.parse_args()
+    base_dir = args.base_dir
+    model_weights_path = args.mag_weight_path
+    # base_dir = "/data_local3/susimmuk/testA"
+    # model_weights_path = "/home/csgrad/susimmuk/acmdeepfake/magnet_epoch12_loss7.28e-02.pth" 
 
-if __name__ == '__main__':
-    main() 
+    # Find all digit-named subfolders
+    video_dirs = [
+        os.path.join(base_dir, d)
+        for d in os.listdir(base_dir)
+        if is_video_folder(os.path.join(base_dir, d))
+    ]
+    print(f"Found {len(video_dirs)} video directories.")
+    video_dirs = sorted(video_dirs)
+    gpu_ids = [0]  # 4 GPUs
+
+    args_list = [
+        (vdir, model_weights_path, gpu_ids[i % len(gpu_ids)])
+        for i, vdir in enumerate(video_dirs)
+    ]
+    nums_workers = min(16, os.cpu_count())
+    with ProcessPoolExecutor(max_workers=nums_workers) as executor:
+        futures = [executor.submit(process_dir, args) for args in args_list]
+        for _ in tqdm(as_completed(futures), total=len(futures), desc="Magnifying videos", file=sys.stdout, disable=False):
+            pass
+
+if __name__ == "__main__":
+    main()

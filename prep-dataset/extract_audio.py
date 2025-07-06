@@ -3,20 +3,23 @@ import os
 import subprocess
 from pathlib import Path
 from tqdm import tqdm
+import argparse
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+parser = argparse.ArgumentParser(description="Extract faces from videos")
+parser.add_argument('--video_root', type=str, required=True, help='Directory containing video files')
+parser.add_argument('--output_base_dir', type=str, required=True, help='Base directory to save extracted faces')
+args = parser.parse_args()
+video_root = args.video_root
+audio_output_root = args.output_base_dir
 
 def extract_audio(video_path):
     """Extract audio from video file using ffmpeg."""
     video_path = Path(video_path)
     audio_path = video_path.with_suffix('.wav')
     
-    # Skip if audio file already exists
-    if audio_path.exists():
-        return str(audio_path)
-    
-    # Check if video exists
     if not video_path.exists():
-        # print(f"Warning: Video file does not exist: {video_path}")
         return None
     
     # First check if video has audio stream
@@ -60,59 +63,32 @@ def extract_audio(video_path):
                 str(audio_path)
             ]
         
-        # Run ffmpeg command with stderr output
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            # print(f"Error processing {video_path}:")
-            # print(f"FFmpeg error: {result.stderr}")
             return None
         return str(audio_path)
     except Exception as e:
-        # print(f"Error processing {video_path}: {str(e)}")
         return None
 
-def process_metadata(json_path):
-    """Process all videos in metadata and update JSON with audio paths."""
-    # Read metadata
-    with open(json_path, 'r') as f:
-        metadata = json.load(f)
-    
-    # Process each entry
-    total = len(metadata)
-    success = 0
-    failed = 0
-    
-    for i, entry in tqdm(enumerate(metadata, 1)):
-        video_path = entry.get('file')
-        if entry.get('audiofile'):
-            continue
-        vpath = os.path.join("/home/csgrad/susimmuk/acmdeepfake/data/AV-Deepfake1M-PlusPlus/train", video_path)
-        if not vpath:
-            continue
-            
-        # print(f"\nProcessing {i}/{total}: {vpath}")
-        
-        # Extract audio
-        audio_path = extract_audio(vpath)
+
+def process_video(fname):
+    if fname.endswith('.mp4'):
+        video_path = os.path.join(video_root, fname)
+        audio_path = extract_audio(video_path)
         if audio_path:
-            entry['audiofile'] = audio_path
-            success += 1
-            print(f"Success: {vpath} -> {audio_path}")
+            video_name = os.path.splitext(fname)[0]
+            target_dir = os.path.join(audio_output_root, video_name)
+            os.makedirs(target_dir, exist_ok=True)
+            target_audio_path = os.path.join(target_dir, f"{video_name}.wav")
+            if audio_path != target_audio_path:
+                os.rename(audio_path, target_audio_path)
         else:
-            failed += 1
-            print(f"Failed to process: {vpath}")
-    
-    # Save updated metadata
-    output_path = json_path.replace('.json', '_with_audio.json')
-    with open(output_path, 'w') as f:
-        json.dump(metadata, f, indent=2)
-    
-    print(f"\nProcessing complete:")
-    print(f"Total files: {total}")
-    print(f"Successful: {success}")
-    print(f"Failed: {failed}") 
-    print(f"Updated metadata saved to: {output_path}")
+            print(f"Failed to extract audio for {video_path}")
 
 if __name__ == "__main__":
-    json_path = "/home/csgrad/susimmuk/acmdeepfake/data/extracted_frames/vox_celeb_2/train_metadata_new.json"
-    process_metadata(json_path) 
+    video_files = [f for f in os.listdir(video_root) if f.endswith('.mp4')]
+    num_workers = min(16,os.cpu_count())
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:  # Adjust max_workers as needed
+        futures = [executor.submit(process_video, fname) for fname in video_files]
+        for _ in tqdm(as_completed(futures), total=len(futures), desc="Extracting audio"):
+            pass
