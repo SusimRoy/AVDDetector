@@ -62,6 +62,8 @@ class AVDeepfake1m(Dataset):
         video_transform: Callable[[Tensor], Tensor] = Identity(),
         audio_transform: Callable[[Tensor], Tensor] = Identity(),
         file_list: Optional[List[str]] = None,
+        train_mag_file_list: Optional[List[str]] = None,
+        train_audio_file_list: Optional[List[str]] = None,
         get_meta_attr: Callable[[Metadata, Tensor, Tensor, T_LABEL], List[Any]] = None,
         require_match_scores: bool = False,
         return_file_name: bool = False,
@@ -79,6 +81,8 @@ class AVDeepfake1m(Dataset):
         self.require_match_scores = require_match_scores
         self.return_file_name = return_file_name
         self.is_plusplus = is_plusplus  # For AV-Deepfake1M++, we modify the structure a little bit.
+        self.train_mag_file_list = train_mag_file_list
+        self.train_audio_file_list = train_audio_file_list
 
         label_dir = os.path.join(self.root, "label")
         if not os.path.exists(label_dir):
@@ -103,13 +107,24 @@ class AVDeepfake1m(Dataset):
 
     def __getitem__(self, index: int) -> List[Union[Tensor, str, int]]:
         file = self.file_list[index]
+        mag_file = self.train_mag_file_list[index]
+        audio_file = self.train_audio_file_list[index]
 
-        video, audio, _ = read_video(os.path.join(self.root, self.subset, file))
+        # video, audio, _ = read_video(os.path.join(self.root, self.subset, file))
+        # video = F.interpolate(video.float().permute(1, 0, 2, 3)[None], size=(self.temporal_size, 96, 96))[0]
+        # audio = F.interpolate(audio.float().permute(1, 0)[None], size=self.audio_temporal_size, mode="linear")[0].permute(1, 0)
+        # video = self.video_transform(video)
+        # audio = self.audio_transform(audio)
+
+        video = read_video_fast(os.path.dirname(mag_file))
         n_frames = video.shape[0]
+        magvideo = read_video(mag_file)
+        audio, sample_rate = read_audio(audio_file)
+        self.audio_length = int(self.temporal_size * sample_rate / 25)
         video = F.interpolate(video.float().permute(1, 0, 2, 3)[None], size=(self.temporal_size, 96, 96))[0]
-        audio = F.interpolate(audio.float().permute(1, 0)[None], size=self.audio_temporal_size, mode="linear")[0].permute(1, 0)
-        video = self.video_transform(video)
-        audio = self.audio_transform(audio)
+        magvideo = F.interpolate(magvideo.float().permute(1, 0, 2, 3)[None], size=(self.temporal_size, 96, 96))[0]
+        audio = self.resize_audio(audio, self.audio_length)
+
         audio = self._get_log_mel_spectrogram(audio)
 
         outputs = [video, audio]
@@ -119,7 +134,20 @@ class AVDeepfake1m(Dataset):
                 subset_folder = self.subset
             else:
                 subset_folder = self.subset + "_metadata"
-            meta = read_json(os.path.join(self.root, subset_folder, file.replace(".mp4", ".json")))
+            # self.og_root = "/data_local3/susimmuk/extracted_frames"
+            # meta = read_json(os.path.join(self.og_root, subset_folder, file.replace(".mp4", ".json")))
+            json_path = file.split("/")[-1].replace(".mp4", ".json")
+            path = os.path.join(os.path.dirname(mag_file), json_path)
+            meta = read_json(path)
+            # json_path = mag_file.replace(".mp4", ".json")
+            # try:
+            #     meta = read_json(json_path)
+            # except FileNotFoundError:
+            #     # Try again after removing "_magnified"
+            #     json_path_alt = json_path.replace("_magnified", "")
+            #     meta = read_json(path)
+            meta["audiofile"] = audio_file
+            # meta["magnifiedfile"] = mag_file
             meta = Metadata(**meta, fps=self.fps)
             if not self.require_match_scores:
                 label, visual_label, audio_label = self.get_label(file, meta)
@@ -136,6 +164,12 @@ class AVDeepfake1m(Dataset):
             outputs = outputs + [n_frames]
 
         return outputs
+    
+    def resize_audio(self, audio, target_length):
+        # audio: shape [1, T]
+        audio = audio.unsqueeze(0).float()  # shape: [1, 1, T]
+        audio = F.interpolate(audio, size=target_length, mode="linear", align_corners=False)  # [1, 1, target_length]
+        return audio.squeeze(0) 
 
     def get_label(self, file: str, meta: Metadata) -> tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
         file_name = file.replace("/", "_").split(".")[0] + ".npz"
@@ -189,6 +223,7 @@ class AVDeepfake1m(Dataset):
 
     def _get_log_mel_spectrogram(self, audio: Tensor) -> Tensor:
         ms = torchaudio.transforms.MelSpectrogram(n_fft=321, n_mels=64)
+        audio = audio.permute(1,0)
         spec = torch.log(ms(audio[:, 0]) + 0.01)
         assert spec.shape == (64, 4 * self.temporal_size), "Wrong log mel-spectrogram setup in Dataset"
         return spec
@@ -271,35 +306,37 @@ class AVDeepfake1mDataModule(LightningDataModule):
             self.test_subset = test_subset
 
     def setup(self, stage: Optional[str] = None) -> None:
-        train_file_list = [meta["file"] for meta in read_json(os.path.join(self.root, "train_metadata.json"))]
-        val_file_list = [meta["file"] for meta in read_json(os.path.join(self.root, "val_metadata.json"))]
-        with open(os.path.join(self.root, f"{self.test_subset}_files.txt"), "r") as f:
-            test_file_list = list(filter(lambda x: x != "", f.read().split("\n")))
+        train_file_list = [meta["file"] for meta in read_json(os.path.join(self.root, "train_metadata_with_audio.json"))]
+        train_mag_file_list = [meta["magnifiedfile"] for meta in read_json(os.path.join(self.root, "train_metadata_with_audio.json"))]
+        train_audio_file_list = [meta["audiofile"] for meta in read_json(os.path.join(self.root, "train_metadata_with_audio.json"))]
+        # val_file_list = [meta["file"] for meta in read_json(os.path.join(self.root, "val_metadata.json"))]
+        # with open(os.path.join(self.root, f"{self.test_subset}_files.txt"), "r") as f:
+        #     test_file_list = list(filter(lambda x: x != "", f.read().split("\n")))
 
-        if self.take_val is not None:
-            val_file_list = val_file_list[:self.take_val]
+        # if self.take_val is not None:
+        #     val_file_list = val_file_list[:self.take_val]
 
-        if self.take_test is not None:
-            test_file_list = test_file_list[:self.take_test]
+        # if self.take_test is not None:
+        #     test_file_list = test_file_list[:self.take_test]
 
         self.train_dataset = self.Dataset("train", self.root, self.temporal_size, self.max_duration, self.fps,
-            file_list=train_file_list, get_meta_attr=self.get_meta_attr,
+            file_list=train_file_list, train_mag_file_list=train_mag_file_list, train_audio_file_list=train_audio_file_list, get_meta_attr=self.get_meta_attr,
             require_match_scores=self.require_match_scores,
             return_file_name=self.return_file_name,
             is_plusplus=self.is_plusplus
         )
-        self.val_dataset = self.Dataset("val", self.root, self.temporal_size, self.max_duration, self.fps,
-            file_list=val_file_list, get_meta_attr=self.get_meta_attr,
-            require_match_scores=self.require_match_scores,
-            return_file_name=self.return_file_name,
-            is_plusplus=self.is_plusplus
-        )
-        self.test_dataset = self.Dataset(self.test_subset, self.root, self.temporal_size, self.max_duration, self.fps,
-            file_list=test_file_list, get_meta_attr=self.get_meta_attr,
-            require_match_scores=self.require_match_scores,
-            return_file_name=self.return_file_name,
-            is_plusplus=self.is_plusplus
-        )
+        # self.val_dataset = self.Dataset("val", self.root, self.temporal_size, self.max_duration, self.fps,
+        #     file_list=val_file_list, get_meta_attr=self.get_meta_attr,
+        #     require_match_scores=self.require_match_scores,
+        #     return_file_name=self.return_file_name,
+        #     is_plusplus=self.is_plusplus
+        # )
+        # self.test_dataset = self.Dataset(self.test_subset, self.root, self.temporal_size, self.max_duration, self.fps,
+        #     file_list=test_file_list, get_meta_attr=self.get_meta_attr,
+        #     require_match_scores=self.require_match_scores,
+        #     return_file_name=self.return_file_name,
+        #     is_plusplus=self.is_plusplus
+        # )
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
         return DataLoader(self.train_dataset, batch_size=self.batch_size, num_workers=self.num_workers,
@@ -307,11 +344,11 @@ class AVDeepfake1mDataModule(LightningDataModule):
             drop_last=True, pin_memory=True
         )
 
-    def val_dataloader(self) -> EVAL_DATALOADERS:
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False, drop_last=False)
+    # def val_dataloader(self) -> EVAL_DATALOADERS:
+    #     return DataLoader(self.val_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False, drop_last=False)
 
-    def test_dataloader(self) -> EVAL_DATALOADERS:
-        return DataLoader(self.test_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False, drop_last=False)
+    # def test_dataloader(self) -> EVAL_DATALOADERS:
+    #     return DataLoader(self.test_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False, drop_last=False)
 
 
 class AVDeepfake1mImages(IterableDataset):
@@ -622,17 +659,24 @@ class AVDeepfake1mPlusPlusMagnifiedVideo(Dataset):
         image_size: int = 96,
         take_num: Optional[int] = None,
         metadata: Optional[List[Metadata]] = None,
-        use_video_label: bool = False
+        use_video_label: bool = False,
+        text_file: str = "/home/csgrad/susimmuk/acmdeepfake/first_25k.txt"
     ):
         self.subset = subset
-        self.data_root = os.path.join(data_root, "AV-Deepfake1M-PlusPlus")
+        # self.data_root = os.path.join(data_root, "train")
+        self.data_root = data_root
         self.mag_data_root = os.path.join(data_root, "extracted_frames")
         self.image_size = image_size
         self.use_video_label = use_video_label
         # self.audio_length = 1934336
-        if metadata is None:
-            metadata_json = read_json(os.path.join(self.mag_data_root, f"{subset}_metadata_with_audio.json"))
-            self.metadata = [Metadata(**meta, fps=25) for meta in metadata_json]
+        self.text_file = text_file
+        # if metadata is None and subset == "train":
+        #     metadata_json = read_json(os.path.join(self.mag_data_root, f"{subset}_metadata_with_audio.json"))
+        #     self.metadata = [Metadata(**meta, fps=25) for meta in metadata_json]
+        if metadata is None and subset == "val":
+            self.text_file = os.path.join(self.text_file, "testB_files.txt")
+            with open(self.text_file, "r") as f:
+                self.metadata = list(filter(lambda x: x != "", f.read().split("\n")))
         else:
             self.metadata = metadata
 
@@ -640,9 +684,8 @@ class AVDeepfake1mPlusPlusMagnifiedVideo(Dataset):
             self.metadata = self.metadata[:take_num]
 
         self.temporal_size = 112
-        # self.mag_frame_idx = self.frame_idx  # Magnified video has double the frames.
 
-        self.total_frames = sum([each.video_frames for each in self.metadata])
+        # self.total_frames = sum([each.video_frames for each in self.metadata])
         print("Load {} data in {}.".format(len(self.metadata), subset))
 
     def __len__(self):
@@ -655,20 +698,36 @@ class AVDeepfake1mPlusPlusMagnifiedVideo(Dataset):
         return audio.squeeze(0) 
 
     def __getitem__(self, idx):
-        meta = self.metadata[idx]
-        video= read_video_fast(os.path.dirname(meta.magnifiedfile))
-        magvideo = read_video(meta.magnifiedfile)
-        audio, sample_rate = read_audio(meta.audiofile)
-        self.audio_length = int(self.temporal_size * sample_rate / 25)
-        video = F.interpolate(video.float().permute(1, 0, 2, 3)[None], size=(self.temporal_size, 96, 96))[0]
-        magvideo = F.interpolate(magvideo.float().permute(1, 0, 2, 3)[None], size=(self.temporal_size, 96, 96))[0]
-        audio = self.resize_audio(audio, self.audio_length)
-        video = video.permute(1, 0, 2, 3)
-        magvideo = magvideo.permute(1, 0, 2, 3)
-        if self.use_video_label:
-            if len(meta.fake_periods)>0:
-                label = 1
-            else:
-                label = 0
-            label = torch.tensor(label, dtype=torch.long)
-            return video, magvideo, audio, label
+        if self.subset == "train":
+            meta = self.metadata[idx]
+            video = read_video_fast(os.path.dirname(meta.magnifiedfile))
+            magvideo = read_video(meta.magnifiedfile)
+            audio, sample_rate = read_audio(meta.audiofile)
+            self.audio_length = int(self.temporal_size * sample_rate / 25)
+            video = F.interpolate(video.float().permute(1, 0, 2, 3)[None], size=(self.temporal_size, 96, 96))[0]
+            magvideo = F.interpolate(magvideo.float().permute(1, 0, 2, 3)[None], size=(self.temporal_size, 96, 96))[0]
+            audio = self.resize_audio(audio, self.audio_length)
+            video = video.permute(1, 0, 2, 3)
+            magvideo = magvideo.permute(1, 0, 2, 3)
+            if self.use_video_label:
+                if len(meta.fake_periods)>0:
+                    label = 1
+                else:
+                    label = 0
+                label = torch.tensor(label, dtype=torch.long)
+                return video, magvideo, audio, label
+        else:
+            test_file = self.metadata[idx]
+            folder_name = os.path.splitext(test_file)[0] 
+            path = os.path.join(self.data_root, folder_name)
+            video = read_video_fast(path)
+            magvideo = read_video(os.path.join(path, "magnified_video.mp4"))
+            path_audio = os.path.join(path, f"{folder_name}.wav")
+            audio, sample_rate = read_audio(path_audio)
+            self.audio_length = int(self.temporal_size * sample_rate / 25)
+            video = F.interpolate(video.float().permute(1, 0, 2, 3)[None], size=(self.temporal_size, 96, 96))[0]
+            magvideo = F.interpolate(magvideo.float().permute(1, 0, 2, 3)[None], size=(self.temporal_size, 96, 96))[0]
+            audio = self.resize_audio(audio, self.audio_length)
+            video = video.permute(1, 0, 2, 3)
+            magvideo = magvideo.permute(1, 0, 2, 3)
+            return video, magvideo, audio, test_file
