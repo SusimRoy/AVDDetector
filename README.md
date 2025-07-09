@@ -36,14 +36,6 @@ python apply_magnification.py --base_dir /path/to/ouput --mag_weight_path /path/
 This file will create the motion magnified video and store it in the same folder as the corresponding video folder where it's frames are stored.
 
 ### Step 5
-Run the test.py in the root directory using the command:
-```bash 
-python test.py --data_root /path/to/output --text_file /path/to/data  --resume /path/to/av-classifier_checkpoint --model av-classifier
-```
-
-This file will run the videos through the model and store the results in prediction.txt in the required format.
-
-### Step 6
 Run the prep-dataset/extract_audio.py using the command:
 
 ```bash
@@ -51,3 +43,11 @@ python extract_audio.py --video_root /path/to/data --output_base_dir /path/to/ou
 ```
 
 This command will extract the audio from the videos and store them as a ``.wav`` file in the corresponding video directory in the /path/to/output
+
+### Step 6
+Run the test.py in the root directory using the command:
+```bash 
+python test.py --data_root /path/to/output --text_file /path/to/data  --resume /path/to/av-classifier_checkpoint --model av-classifier
+```
+
+This file will run the videos through the model and store the results in prediction.txt in the required format.
